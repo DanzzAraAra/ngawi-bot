@@ -9,7 +9,7 @@
     "name": "Dandy"
   },
   "api": {
-    "baseUrl": "https://sylvatica.my.id",
+    "baseUrl": "https://sylvatica.cloud",
     "key": "",
     "header": "x-api-key"
     }
