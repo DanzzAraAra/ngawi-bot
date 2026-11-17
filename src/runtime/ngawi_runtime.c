@@ -1,0 +1,1610 @@
+#include "ngawi_runtime.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct RuntimeAllocs {
+  void **items;
+  size_t count;
+  size_t cap;
+  int initialized;
+} RuntimeAllocs;
+
+typedef struct ArrayCapEntry {
+  void *data;
+  int64_t cap;
+} ArrayCapEntry;
+
+typedef struct ArrayCaps {
+  ArrayCapEntry *items;
+  size_t count;
+  size_t cap;
+} ArrayCaps;
+
+static RuntimeAllocs g_runtime_allocs = {0};
+static ArrayCaps g_array_caps = {0};
+
+static void ng_runtime_cleanup(void) {
+  for (size_t i = 0; i < g_runtime_allocs.count; i++) {
+    free(g_runtime_allocs.items[i]);
+  }
+  free(g_runtime_allocs.items);
+  g_runtime_allocs.items = NULL;
+  g_runtime_allocs.count = 0;
+  g_runtime_allocs.cap = 0;
+
+  free(g_array_caps.items);
+  g_array_caps.items = NULL;
+  g_array_caps.count = 0;
+  g_array_caps.cap = 0;
+
+  g_runtime_allocs.initialized = 0;
+}
+
+static int ng_runtime_init(void) {
+  if (g_runtime_allocs.initialized) return 1;
+  if (atexit(ng_runtime_cleanup) != 0) return 0;
+  g_runtime_allocs.initialized = 1;
+  return 1;
+}
+
+static int ng_runtime_alloc_index_of(void *ptr) {
+  if (!ptr) return -1;
+  for (size_t i = 0; i < g_runtime_allocs.count; i++) {
+    if (g_runtime_allocs.items[i] == ptr) return (int)i;
+  }
+  return -1;
+}
+
+static int ng_array_cap_index_of(void *data) {
+  if (!data) return -1;
+  for (size_t i = 0; i < g_array_caps.count; i++) {
+    if (g_array_caps.items[i].data == data) return (int)i;
+  }
+  return -1;
+}
+
+static int ng_runtime_ptr_is_tracked(void *ptr) { return ng_runtime_alloc_index_of(ptr) >= 0; }
+
+static int ng_array_cap_set(void *data, int64_t cap) {
+  if (!data) return 1;
+
+  int idx = ng_array_cap_index_of(data);
+  if (idx >= 0) {
+    g_array_caps.items[idx].cap = cap;
+    return 1;
+  }
+
+  if (g_array_caps.count == g_array_caps.cap) {
+    size_t next_cap = g_array_caps.cap == 0 ? 32 : g_array_caps.cap * 2;
+    ArrayCapEntry *next =
+        (ArrayCapEntry *)realloc(g_array_caps.items, next_cap * sizeof(ArrayCapEntry));
+    if (!next) return 0;
+    g_array_caps.items = next;
+    g_array_caps.cap = next_cap;
+  }
+
+  g_array_caps.items[g_array_caps.count].data = data;
+  g_array_caps.items[g_array_caps.count].cap = cap;
+  g_array_caps.count++;
+  return 1;
+}
+
+static int64_t ng_array_cap_get_or_len(void *data, int64_t len) {
+  int idx = ng_array_cap_index_of(data);
+  if (idx >= 0) return g_array_caps.items[idx].cap;
+  return len;
+}
+
+static void *ng_runtime_alloc(size_t size) {
+  if (!ng_runtime_init()) return NULL;
+
+  void *p = malloc(size);
+  if (!p) return NULL;
+
+  if (g_runtime_allocs.count == g_runtime_allocs.cap) {
+    size_t next_cap = g_runtime_allocs.cap == 0 ? 64 : g_runtime_allocs.cap * 2;
+    void **next = (void **)realloc(g_runtime_allocs.items, next_cap * sizeof(void *));
+    if (!next) {
+      free(p);
+      return NULL;
+    }
+    g_runtime_allocs.items = next;
+    g_runtime_allocs.cap = next_cap;
+  }
+
+  g_runtime_allocs.items[g_runtime_allocs.count++] = p;
+  return p;
+}
+
+static void *ng_runtime_realloc(size_t elem_size, void *old_ptr, int64_t new_cap) {
+  if (!old_ptr || new_cap <= 0) return NULL;
+  int alloc_idx = ng_runtime_alloc_index_of(old_ptr);
+  if (alloc_idx < 0) return NULL;
+
+  void *p = realloc(old_ptr, (size_t)new_cap * elem_size);
+  if (!p) return NULL;
+
+  g_runtime_allocs.items[alloc_idx] = p;
+
+  int cap_idx = ng_array_cap_index_of(old_ptr);
+  if (cap_idx >= 0) {
+    g_array_caps.items[cap_idx].data = p;
+    g_array_caps.items[cap_idx].cap = new_cap;
+  } else if (!ng_array_cap_set(p, new_cap)) {
+    return NULL;
+  }
+
+  return p;
+}
+
+static int64_t ng_next_capacity(int64_t current_cap, int64_t need_len) {
+  int64_t cap = current_cap > 0 ? current_cap : 4;
+  while (cap < need_len) {
+    if (cap > (INT64_MAX / 2)) return need_len;
+    cap *= 2;
+  }
+  return cap;
+}
+
+static void *ng_array_push_prepare(void *data, int64_t len, size_t elem_size) {
+  int64_t new_len = len + 1;
+  int64_t cap = ng_array_cap_get_or_len(data, len);
+
+  if (!data) {
+    int64_t next_cap = ng_next_capacity(0, new_len);
+    void *out = ng_runtime_alloc((size_t)next_cap * elem_size);
+    if (!out) return NULL;
+    if (!ng_array_cap_set(out, next_cap)) return NULL;
+    return out;
+  }
+
+  if (cap >= new_len) return data;
+
+  int64_t next_cap = ng_next_capacity(cap, new_len);
+  if (ng_runtime_ptr_is_tracked(data)) {
+    return ng_runtime_realloc(elem_size, data, next_cap);
+  }
+
+  void *out = ng_runtime_alloc((size_t)next_cap * elem_size);
+  if (!out) return NULL;
+  memcpy(out, data, (size_t)len * elem_size);
+  if (!ng_array_cap_set(out, next_cap)) return NULL;
+  return out;
+}
+
+static char *ng_runtime_string_alloc(size_t size) { return (char *)ng_runtime_alloc(size); }
+
+void ng_print_int(int64_t v) { printf("%lld", (long long)v); }
+
+void ng_print_float(double v) { printf("%.17g", v); }
+
+void ng_print_bool(bool v) { fputs(v ? "true" : "false", stdout); }
+
+void ng_print_string(const char *s) { fputs(s ? s : "", stdout); }
+
+static void ng_runtime_error(const char *msg) {
+  fprintf(stderr, "runtime error: %s\n", msg);
+  exit(1);
+}
+
+int64_t ng_array_checked_index(int64_t index, int64_t len) {
+  if (index < 0 || index >= len) {
+    fprintf(stderr, "runtime error: array index out of bounds (index=%lld, len=%lld)\n",
+            (long long)index, (long long)len);
+    exit(1);
+  }
+  return index;
+}
+
+int64_t ng_int_array_get(ng_int_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+ng_int_array_t ng_int2_array_get(ng_int2_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+double ng_float_array_get(ng_float_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+ng_float_array_t ng_float2_array_get(ng_float2_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+bool ng_bool_array_get(ng_bool_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+ng_bool_array_t ng_bool2_array_get(ng_bool2_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+const char *ng_string_array_get(ng_string_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+ng_string_array_t ng_string2_array_get(ng_string2_array_t arr, int64_t index) {
+  return arr.data[ng_array_checked_index(index, arr.len)];
+}
+
+void ng_int_array_set(ng_int_array_t *arr, int64_t index, int64_t value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_int2_array_set(ng_int2_array_t *arr, int64_t index, ng_int_array_t value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_float_array_set(ng_float_array_t *arr, int64_t index, double value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_float2_array_set(ng_float2_array_t *arr, int64_t index, ng_float_array_t value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_bool_array_set(ng_bool_array_t *arr, int64_t index, bool value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_bool2_array_set(ng_bool2_array_t *arr, int64_t index, ng_bool_array_t value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_string_array_set(ng_string_array_t *arr, int64_t index, const char *value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+void ng_string2_array_set(ng_string2_array_t *arr, int64_t index, ng_string_array_t value) {
+  arr->data[ng_array_checked_index(index, arr->len)] = value;
+}
+
+ng_int_array_t ng_int_array_push(ng_int_array_t arr, int64_t value) {
+  int64_t new_len = arr.len + 1;
+  int64_t *out = (int64_t *)ng_array_push_prepare(arr.data, arr.len, sizeof(int64_t));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_int_array_t r = {out, new_len};
+  return r;
+}
+
+ng_int_array_t ng_int_array_pop(ng_int_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty int[]");
+  ng_int_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_int2_array_t ng_int2_array_push(ng_int2_array_t arr, ng_int_array_t value) {
+  int64_t new_len = arr.len + 1;
+  ng_int_array_t *out =
+      (ng_int_array_t *)ng_array_push_prepare(arr.data, arr.len, sizeof(ng_int_array_t));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_int2_array_t r = {out, new_len};
+  return r;
+}
+
+ng_int2_array_t ng_int2_array_pop(ng_int2_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty int[][]");
+  ng_int2_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_float_array_t ng_float_array_push(ng_float_array_t arr, double value) {
+  int64_t new_len = arr.len + 1;
+  double *out = (double *)ng_array_push_prepare(arr.data, arr.len, sizeof(double));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_float_array_t r = {out, new_len};
+  return r;
+}
+
+ng_float_array_t ng_float_array_pop(ng_float_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty float[]");
+  ng_float_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_float2_array_t ng_float2_array_push(ng_float2_array_t arr, ng_float_array_t value) {
+  int64_t new_len = arr.len + 1;
+  ng_float_array_t *out =
+      (ng_float_array_t *)ng_array_push_prepare(arr.data, arr.len, sizeof(ng_float_array_t));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_float2_array_t r = {out, new_len};
+  return r;
+}
+
+ng_float2_array_t ng_float2_array_pop(ng_float2_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty float[][]");
+  ng_float2_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_bool_array_t ng_bool_array_push(ng_bool_array_t arr, bool value) {
+  int64_t new_len = arr.len + 1;
+  bool *out = (bool *)ng_array_push_prepare(arr.data, arr.len, sizeof(bool));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_bool_array_t r = {out, new_len};
+  return r;
+}
+
+ng_bool_array_t ng_bool_array_pop(ng_bool_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty bool[]");
+  ng_bool_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_bool2_array_t ng_bool2_array_push(ng_bool2_array_t arr, ng_bool_array_t value) {
+  int64_t new_len = arr.len + 1;
+  ng_bool_array_t *out =
+      (ng_bool_array_t *)ng_array_push_prepare(arr.data, arr.len, sizeof(ng_bool_array_t));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_bool2_array_t r = {out, new_len};
+  return r;
+}
+
+ng_bool2_array_t ng_bool2_array_pop(ng_bool2_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty bool[][]");
+  ng_bool2_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_string_array_t ng_string_array_push(ng_string_array_t arr, const char *value) {
+  int64_t new_len = arr.len + 1;
+  const char **out =
+      (const char **)ng_array_push_prepare((void *)arr.data, arr.len, sizeof(const char *));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_string_array_t r = {out, new_len};
+  return r;
+}
+
+ng_string_array_t ng_string_array_pop(ng_string_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty string[]");
+  ng_string_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+ng_string2_array_t ng_string2_array_push(ng_string2_array_t arr, ng_string_array_t value) {
+  int64_t new_len = arr.len + 1;
+  ng_string_array_t *out =
+      (ng_string_array_t *)ng_array_push_prepare(arr.data, arr.len, sizeof(ng_string_array_t));
+  if (!out) return arr;
+  out[new_len - 1] = value;
+  ng_string2_array_t r = {out, new_len};
+  return r;
+}
+
+ng_string2_array_t ng_string2_array_pop(ng_string2_array_t arr) {
+  if (arr.len <= 0) ng_runtime_error("pop() on empty string[][]");
+  ng_string2_array_t r = {arr.data, arr.len - 1};
+  return r;
+}
+
+int ng_string_eq(const char *a, const char *b) {
+  if (a == b) return 1;
+  if (!a || !b) return 0;
+  return strcmp(a, b) == 0;
+}
+
+int64_t ng_string_len(const char *s) {
+  if (!s) return 0;
+  return (int64_t)strlen(s);
+}
+
+const char *ng_string_concat(const char *a, const char *b) {
+  const char *lhs = a ? a : "";
+  const char *rhs = b ? b : "";
+
+  size_t la = strlen(lhs);
+  size_t lb = strlen(rhs);
+
+  char *out = ng_runtime_string_alloc(la + lb + 1);
+  if (!out) return "";
+
+  memcpy(out, lhs, la);
+  memcpy(out + la, rhs, lb);
+  out[la + lb] = '\0';
+  return out;
+}
+
+int ng_string_contains(const char *s, const char *sub) {
+  const char *haystack = s ? s : "";
+  const char *needle = sub ? sub : "";
+  return strstr(haystack, needle) != NULL;
+}
+
+int ng_string_starts_with(const char *s, const char *prefix) {
+  const char *str = s ? s : "";
+  const char *pre = prefix ? prefix : "";
+  size_t n = strlen(pre);
+  return strncmp(str, pre, n) == 0;
+}
+
+int ng_string_ends_with(const char *s, const char *suffix) {
+  const char *str = s ? s : "";
+  const char *suf = suffix ? suffix : "";
+  size_t ls = strlen(str);
+  size_t le = strlen(suf);
+  if (le > ls) return 0;
+  return strcmp(str + (ls - le), suf) == 0;
+}
+
+const char *ng_string_to_lower(const char *s) {
+  const char *src = s ? s : "";
+  size_t n = strlen(src);
+  char *out = ng_runtime_string_alloc(n + 1);
+  if (!out) return "";
+
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if (c >= 'A' && c <= 'Z') {
+      out[i] = (char)(c - 'A' + 'a');
+    } else {
+      out[i] = (char)c;
+    }
+  }
+  out[n] = '\0';
+  return out;
+}
+
+const char *ng_string_to_upper(const char *s) {
+  const char *src = s ? s : "";
+  size_t n = strlen(src);
+  char *out = ng_runtime_string_alloc(n + 1);
+  if (!out) return "";
+
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if (c >= 'a' && c <= 'z') {
+      out[i] = (char)(c - 'a' + 'A');
+    } else {
+      out[i] = (char)c;
+    }
+  }
+  out[n] = '\0';
+  return out;
+}
+
+static int ng_is_space(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+const char *ng_string_trim(const char *s) {
+  const char *src = s ? s : "";
+  size_t n = strlen(src);
+  size_t lo = 0;
+  while (lo < n && ng_is_space((unsigned char)src[lo])) lo++;
+
+  size_t hi = n;
+  while (hi > lo && ng_is_space((unsigned char)src[hi - 1])) hi--;
+
+  size_t out_n = hi - lo;
+  char *out = ng_runtime_string_alloc(out_n + 1);
+  if (!out) return "";
+  if (out_n > 0) memcpy(out, src + lo, out_n);
+  out[out_n] = '\0';
+  return out;
+}
+
+#include <curl/curl.h>
+#include <ctype.h>
+#include <limits.h>
+
+typedef struct {
+  char *data;
+  size_t len;
+} NgHttpBuffer;
+
+static size_t ng_http_write(void *data, size_t size, size_t count, void *user) {
+  size_t len = size * count;
+  NgHttpBuffer *buffer = (NgHttpBuffer *)user;
+
+  char *next = realloc(buffer->data, buffer->len + len + 1);
+  if (!next) return 0;
+
+  buffer->data = next;
+  memcpy(buffer->data + buffer->len, data, len);
+  buffer->len += len;
+  buffer->data[buffer->len] = '\0';
+
+  return len;
+}
+
+static CURL *ng_http_init(void) {
+  static int initialized = 0;
+
+  if (!initialized) {
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return NULL;
+    initialized = 1;
+  }
+
+  CURL *curl = curl_easy_init();
+  if (!curl) return NULL;
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ng_http_write);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 40L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  return curl;
+}
+
+static const char *ng_http_result(NgHttpBuffer *buffer) {
+  if (!buffer->data) return "{}";
+
+  char *result = ng_runtime_string_alloc(buffer->len + 1);
+  if (!result) return "{}";
+
+  memcpy(result, buffer->data, buffer->len + 1);
+  return result;
+}
+
+static const char *ng_api_base_url = "";
+static const char *ng_api_key = "";
+static const char *ng_api_header = "";
+
+void ng_api_config(const char *base_url, const char *key, const char *header) {
+  ng_api_base_url = base_url ? base_url : "";
+  ng_api_key = key ? key : "";
+  ng_api_header = header ? header : "";
+}
+
+static const char *ng_api_request(const char *method, const char *path, const char *body) {
+  if (!*ng_api_base_url || !path) return "{}";
+
+  size_t base_len = strlen(ng_api_base_url);
+  size_t path_len = strlen(path);
+
+  while (base_len > 0 && ng_api_base_url[base_len - 1] == '/') base_len--;
+
+  size_t path_start = path[0] == '/' ? 1 : 0;
+  size_t url_len = base_len + path_len - path_start;
+
+  char *url = malloc(url_len + 2);
+  if (!url) return "{}";
+
+  memcpy(url, ng_api_base_url, base_len);
+  url[base_len] = '/';
+  memcpy(url + base_len + 1, path + path_start, path_len - path_start);
+  url[url_len + 1] = '\0';
+
+  CURL *escape_curl = ng_http_init();
+  if (!escape_curl) {
+    free(url);
+    return "{}";
+  }
+
+  char *escaped_key = curl_easy_escape(escape_curl, ng_api_key, 0);
+  if (escaped_key && *ng_api_key && strstr(path, "/api/search/yts") != NULL) {
+    size_t needed = strlen(url) + strlen(escaped_key) + 16;
+    char *next = realloc(url, needed);
+    if (next) {
+      url = next;
+      strcat(url, strchr(url, '?') ? "&apikey=" : "?apikey=");
+      strcat(url, escaped_key);
+    }
+  }
+  curl_free(escaped_key);
+  curl_easy_cleanup(escape_curl);
+
+  CURL *curl = ng_http_init();
+  if (!curl) {
+    free(url);
+    return "{}";
+  }
+
+  NgHttpBuffer buffer = {0};
+  struct curl_slist *headers = NULL;
+
+  headers = curl_slist_append(headers, "Accept: application/json");
+
+  if (*ng_api_key && *ng_api_header) {
+    size_t n = strlen(ng_api_header) + strlen(ng_api_key) + 3;
+    char *header = malloc(n);
+
+    if (header) {
+      snprintf(header, n, "%s: %s", ng_api_header, ng_api_key);
+      headers = curl_slist_append(headers, header);
+      free(header);
+    }
+  }
+
+  if (strcmp(method, "POST") == 0) {
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "{}");
+  } else {
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+  }
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+
+  CURLcode result = curl_easy_perform(curl);
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  free(url);
+
+  const char *output = result == CURLE_OK ? ng_http_result(&buffer) : "{}";
+
+  free(buffer.data);
+  return output;
+}
+
+const char *ng_api_get(const char *path) {
+  return ng_api_request("GET", path, NULL);
+}
+
+const char *ng_api_post(const char *path, const char *body) {
+  return ng_api_request("POST", path, body);
+}
+
+static const char *ng_json_space(const char *p) {
+  while (*p && isspace((unsigned char)*p)) p++;
+  return p;
+}
+
+static const char *ng_json_string_end(const char *p) {
+  if (*p != '"') return p;
+
+  p++;
+
+  while (*p) {
+    if (*p == '\\') {
+      if (p[1]) p += 2;
+      else return p;
+    } else if (*p == '"') {
+      return p + 1;
+    } else {
+      p++;
+    }
+  }
+
+  return p;
+}
+
+static const char *ng_json_skip(const char *p) {
+  p = ng_json_space(p);
+
+  if (*p == '"') return ng_json_string_end(p);
+
+  if (*p == '{' || *p == '[') {
+    char end = *p == '{' ? '}' : ']';
+    p++;
+
+    while (*p) {
+      p = ng_json_space(p);
+
+      if (*p == end) return p + 1;
+
+      if (*p == ',' || *p == ':') {
+        p++;
+        continue;
+      }
+
+      const char *next = ng_json_skip(p);
+      if (next <= p) return p;
+      p = next;
+    }
+
+    return p;
+  }
+
+  while (*p && *p != ',' && *p != ']' && *p != '}' &&
+         !isspace((unsigned char)*p)) {
+    p++;
+  }
+
+  return p;
+}
+
+static int ng_json_key_eq(const char *p, const char *key) {
+  if (!p || *p != '"') return 0;
+
+  const char *s = p + 1;
+  size_t i = 0;
+
+  while (s[i] && s[i] != '"') {
+    if (s[i] == '\\') return 0;
+    if (s[i] != key[i]) return 0;
+    i++;
+  }
+
+  return s[i] == '"' && key[i] == '\0';
+}
+
+static const char *ng_json_object_get(const char *object, const char *key) {
+  if (!object || *ng_json_space(object) != '{') return NULL;
+
+  const char *p = ng_json_space(object) + 1;
+
+  while (*p) {
+    p = ng_json_space(p);
+
+    if (*p == '}') return NULL;
+    if (*p != '"') return NULL;
+
+    const char *key_start = p;
+    p = ng_json_string_end(p);
+    p = ng_json_space(p);
+
+    if (*p != ':') return NULL;
+    p = ng_json_space(p + 1);
+
+    if (ng_json_key_eq(key_start, key)) return p;
+
+    const char *next = ng_json_skip(p);
+    if (next <= p) return NULL;
+
+    p = ng_json_space(next);
+    if (*p == ',') p++;
+    else if (*p == '}') return NULL;
+    else return NULL;
+  }
+
+  return NULL;
+}
+
+static const char *ng_json_array_get(const char *array, int64_t index) {
+  if (!array || *ng_json_space(array) != '[' || index < 0) return NULL;
+
+  const char *p = ng_json_space(array) + 1;
+  int64_t current = 0;
+
+  while (*p) {
+    p = ng_json_space(p);
+
+    if (*p == ']') return NULL;
+
+    if (current == index) return p;
+
+    const char *next = ng_json_skip(p);
+    if (next <= p) return NULL;
+
+    p = ng_json_space(next);
+    if (*p == ',') p++;
+    else if (*p == ']') return NULL;
+    else return NULL;
+
+    current++;
+  }
+
+  return NULL;
+}
+
+static const char *ng_json_result_array(const char *json) {
+  return ng_json_object_get(json, "result");
+}
+
+static const char *ng_json_message(const char *json, int64_t index) {
+  const char *result = ng_json_result_array(json);
+  const char *update = ng_json_array_get(result, index);
+
+  if (!update) return NULL;
+
+  const char *message = ng_json_object_get(update, "message");
+  if (!message) message = ng_json_object_get(update, "edited_message");
+  if (!message) message = ng_json_object_get(update, "channel_post");
+  if (!message) message = ng_json_object_get(update, "edited_channel_post");
+
+  return message;
+}
+
+static int64_t ng_json_integer(const char *value) {
+  if (!value) return 0;
+
+  char *end = NULL;
+  long long result = strtoll(value, &end, 10);
+
+  if (end == value) return 0;
+  return (int64_t)result;
+}
+
+static const char *ng_json_decode_string(const char *value) {
+  if (!value || *value != '"') return "";
+
+  const char *p = value + 1;
+  size_t cap = strlen(p) + 1;
+  char *out = ng_runtime_string_alloc(cap);
+  if (!out) return "";
+
+  size_t len = 0;
+
+  while (*p && *p != '"') {
+    if (*p != '\\') {
+      out[len++] = *p++;
+      continue;
+    }
+
+    p++;
+
+    switch (*p) {
+      case '"': out[len++] = '"'; p++; break;
+      case '\\': out[len++] = '\\'; p++; break;
+      case '/': out[len++] = '/'; p++; break;
+      case 'b': out[len++] = '\b'; p++; break;
+      case 'f': out[len++] = '\f'; p++; break;
+      case 'n': out[len++] = '\n'; p++; break;
+      case 'r': out[len++] = '\r'; p++; break;
+      case 't': out[len++] = '\t'; p++; break;
+      case 'u':
+        if (p[1] && p[2] && p[3] && p[4]) {
+          char hex[5] = {p[1], p[2], p[3], p[4], '\0'};
+          unsigned long code = strtoul(hex, NULL, 16);
+
+          if (code <= 0x7F) {
+            out[len++] = (char)code;
+          } else if (code <= 0x7FF) {
+            out[len++] = (char)(0xC0 | (code >> 6));
+            out[len++] = (char)(0x80 | (code & 0x3F));
+          } else {
+            out[len++] = (char)(0xE0 | (code >> 12));
+            out[len++] = (char)(0x80 | ((code >> 6) & 0x3F));
+            out[len++] = (char)(0x80 | (code & 0x3F));
+          }
+
+          p += 5;
+        } else {
+          p++;
+        }
+        break;
+      default:
+        if (*p) out[len++] = *p++;
+        break;
+    }
+  }
+
+  out[len] = '\0';
+  return out;
+}
+
+const char *ng_rusdi_get_update(const char *token, int64_t offset) {
+  if (!token || !*token) return "{}";
+
+  char url[2048];
+  snprintf(url, sizeof(url),
+           "https://api.telegram.org/bot%s/getUpdates?offset=%lld&timeout=30",
+           token, (long long)offset);
+
+  CURL *curl = ng_http_init();
+  if (!curl) return "{}";
+
+  NgHttpBuffer buffer = {0};
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+
+  CURLcode result = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  curl_easy_cleanup(curl);
+
+  const char *output = "{}";
+
+  if (result == CURLE_OK && status == 200) {
+    output = ng_http_result(&buffer);
+  }
+
+  free(buffer.data);
+  return output;
+}
+
+int64_t ng_telegram_count(const char *json) {
+  const char *array = ng_json_result_array(json);
+  if (!array || *ng_json_space(array) != '[') return 0;
+
+  int64_t count = 0;
+  const char *p = ng_json_space(array) + 1;
+
+  while (*p) {
+    p = ng_json_space(p);
+
+    if (*p == ']') break;
+
+    const char *next = ng_json_skip(p);
+    if (next <= p) break;
+
+    count++;
+    p = ng_json_space(next);
+
+    if (*p == ',') p++;
+    else break;
+  }
+
+  return count;
+}
+
+const char *ng_telegram_text(const char *json, int64_t index) {
+  const char *message = ng_json_message(json, index);
+  if (!message) return "";
+
+  const char *text = ng_json_object_get(message, "text");
+  if (!text) text = ng_json_object_get(message, "caption");
+
+  return ng_json_decode_string(text);
+}
+
+int64_t ng_telegram_chat_id(const char *json, int64_t index) {
+  const char *message = ng_json_message(json, index);
+  if (!message) return 0;
+
+  const char *chat = ng_json_object_get(message, "chat");
+  const char *id = ng_json_object_get(chat, "id");
+
+  return ng_json_integer(id);
+}
+
+int64_t ng_telegram_update_id(const char *json, int64_t index) {
+  const char *update = ng_json_array_get(ng_json_result_array(json), index);
+  return ng_json_integer(ng_json_object_get(update, "update_id"));
+}
+
+bool ng_rusdi_send(const char *token, int64_t chat_id, const char *text) {
+  if (!token || !*token) return false;
+
+  CURL *curl = ng_http_init();
+  if (!curl) return false;
+
+  char url[2048];
+  snprintf(url, sizeof(url),
+           "https://api.telegram.org/bot%s/sendMessage", token);
+
+  char chat[64];
+  snprintf(chat, sizeof(chat), "%lld", (long long)chat_id);
+
+  char *escaped_chat = curl_easy_escape(curl, chat, 0);
+  char *escaped_text = curl_easy_escape(curl, text ? text : "", 0);
+
+  if (!escaped_chat || !escaped_text) {
+    curl_free(escaped_chat);
+    curl_free(escaped_text);
+    curl_easy_cleanup(curl);
+    return false;
+  }
+
+  char *escaped_mode = curl_easy_escape(curl, "Markdown", 0);
+
+  if (!escaped_mode) {
+    curl_free(escaped_chat);
+    curl_free(escaped_text);
+    curl_easy_cleanup(curl);
+    return false;
+  }
+
+  size_t body_size = strlen(escaped_chat) + strlen(escaped_text) + strlen(escaped_mode) + 32;
+  char *body = malloc(body_size);
+
+  if (!body) {
+    curl_free(escaped_chat);
+    curl_free(escaped_text);
+    curl_easy_cleanup(curl);
+    return false;
+  }
+
+  snprintf(body, body_size, "chat_id=%s&text=%s&parse_mode=%s", escaped_chat, escaped_text, escaped_mode);
+
+  NgHttpBuffer buffer = {0};
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+
+  CURLcode result = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+  curl_easy_cleanup(curl);
+  curl_free(escaped_chat);
+  curl_free(escaped_text);
+  curl_free(escaped_mode);
+  free(body);
+
+  bool success = result == CURLE_OK && status == 200 &&
+                 buffer.data && strstr(buffer.data, "\"ok\":true");
+
+  free(buffer.data);
+  return success;
+}
+
+typedef enum {
+  NG_JSON_NULL,
+  NG_JSON_BOOL,
+  NG_JSON_INT,
+  NG_JSON_FLOAT,
+  NG_JSON_STRING,
+  NG_JSON_ARRAY,
+  NG_JSON_OBJECT
+} NgJsonType;
+
+typedef struct NgJson {
+  NgJsonType type;
+  union {
+    int boolean;
+    int64_t int_val;
+    double float_val;
+    char *string_val;
+    struct {
+      struct NgJson **items;
+      size_t count;
+      size_t cap;
+    } array_val;
+    struct {
+      char **keys;
+      struct NgJson **values;
+      size_t count;
+      size_t cap;
+    } object_val;
+  };
+} NgJson;
+
+static void ng_json_free(NgJson *node) {
+  if (!node) return;
+  if (node->type == NG_JSON_STRING && node->string_val) {
+    free(node->string_val);
+  } else if (node->type == NG_JSON_ARRAY) {
+    for (size_t i = 0; i < node->array_val.count; i++) {
+      ng_json_free(node->array_val.items[i]);
+    }
+    free(node->array_val.items);
+  } else if (node->type == NG_JSON_OBJECT) {
+    for (size_t i = 0; i < node->object_val.count; i++) {
+      free(node->object_val.keys[i]);
+      ng_json_free(node->object_val.values[i]);
+    }
+    free(node->object_val.keys);
+    free(node->object_val.values);
+  }
+  free(node);
+}
+
+static const char *ng_json_skip_whitespace(const char *p) {
+  while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+  return p;
+}
+
+static NgJson *ng_json_parse_value(const char **p, int *error);
+
+static char *ng_json_parse_string_lit(const char **p, int *error) {
+  const char *s = *p;
+  if (*s != '"') { *error = 1; return NULL; }
+  s++;
+
+  size_t len = 0;
+  size_t cap = 64;
+  char *buf = malloc(cap);
+  if (!buf) { *error = 1; return NULL; }
+
+  while (*s && *s != '"') {
+    if (*s == '\\') {
+      s++;
+      if (!*s) { free(buf); *error = 1; return NULL; }
+      char esc = *s++;
+      char add = esc;
+      if (esc == 'n') add = '\n';
+      else if (esc == 't') add = '\t';
+      else if (esc == 'r') add = '\r';
+      else if (esc == 'b') add = '\b';
+      else if (esc == 'f') add = '\f';
+      else if (esc == 'u') {
+        char hex[5] = {0};
+        for (int i = 0; i < 4 && *s; i++) hex[i] = *s++;
+        unsigned long code = strtoul(hex, NULL, 16);
+        if (code <= 0x7F) {
+          add = (char)code;
+        } else {
+          add = '?';
+        }
+      }
+      if (len + 1 >= cap) {
+        cap *= 2;
+        char *nb = realloc(buf, cap);
+        if (!nb) { free(buf); *error = 1; return NULL; }
+        buf = nb;
+      }
+      buf[len++] = add;
+    } else {
+      if (len + 1 >= cap) {
+        cap *= 2;
+        char *nb = realloc(buf, cap);
+        if (!nb) { free(buf); *error = 1; return NULL; }
+        buf = nb;
+      }
+      buf[len++] = *s++;
+    }
+  }
+
+  if (*s != '"') { free(buf); *error = 1; return NULL; }
+  s++;
+  buf[len] = '\0';
+  *p = s;
+  return buf;
+}
+
+static NgJson *ng_json_parse_value(const char **p, int *error) {
+  *p = ng_json_skip_whitespace(*p);
+  if (!**p) { *error = 1; return NULL; }
+
+  if (**p == 'n') {
+    if (strncmp(*p, "null", 4) == 0) {
+      *p += 4;
+      NgJson *node = calloc(1, sizeof(NgJson));
+      node->type = NG_JSON_NULL;
+      return node;
+    }
+    *error = 1; return NULL;
+  }
+  if (**p == 't') {
+    if (strncmp(*p, "true", 4) == 0) {
+      *p += 4;
+      NgJson *node = calloc(1, sizeof(NgJson));
+      node->type = NG_JSON_BOOL;
+      node->boolean = 1;
+      return node;
+    }
+    *error = 1; return NULL;
+  }
+  if (**p == 'f') {
+    if (strncmp(*p, "false", 5) == 0) {
+      *p += 5;
+      NgJson *node = calloc(1, sizeof(NgJson));
+      node->type = NG_JSON_BOOL;
+      node->boolean = 0;
+      return node;
+    }
+    *error = 1; return NULL;
+  }
+  if (**p == '"') {
+    char *str = ng_json_parse_string_lit(p, error);
+    if (*error) return NULL;
+    NgJson *node = calloc(1, sizeof(NgJson));
+    node->type = NG_JSON_STRING;
+    node->string_val = str;
+    return node;
+  }
+  if (**p == '[') {
+    (*p)++;
+    NgJson *node = calloc(1, sizeof(NgJson));
+    node->type = NG_JSON_ARRAY;
+    node->array_val.cap = 8;
+    node->array_val.items = malloc(node->array_val.cap * sizeof(NgJson*));
+
+    *p = ng_json_skip_whitespace(*p);
+    if (**p == ']') {
+      (*p)++;
+      return node;
+    }
+
+    while (**p) {
+      NgJson *item = ng_json_parse_value(p, error);
+      if (*error) { ng_json_free(node); return NULL; }
+
+      if (node->array_val.count >= node->array_val.cap) {
+        node->array_val.cap *= 2;
+        node->array_val.items = realloc(node->array_val.items, node->array_val.cap * sizeof(NgJson*));
+      }
+      node->array_val.items[node->array_val.count++] = item;
+
+      *p = ng_json_skip_whitespace(*p);
+      if (**p == ']') {
+        (*p)++;
+        return node;
+      } else if (**p == ',') {
+        (*p)++;
+      } else {
+        *error = 1; ng_json_free(node); return NULL;
+      }
+    }
+    *error = 1; ng_json_free(node); return NULL;
+  }
+  if (**p == '{') {
+    (*p)++;
+    NgJson *node = calloc(1, sizeof(NgJson));
+    node->type = NG_JSON_OBJECT;
+    node->object_val.cap = 8;
+    node->object_val.keys = malloc(node->object_val.cap * sizeof(char*));
+    node->object_val.values = malloc(node->object_val.cap * sizeof(NgJson*));
+
+    *p = ng_json_skip_whitespace(*p);
+    if (**p == '}') {
+      (*p)++;
+      return node;
+    }
+
+    while (**p) {
+      *p = ng_json_skip_whitespace(*p);
+      if (**p != '"') { *error = 1; ng_json_free(node); return NULL; }
+      char *key = ng_json_parse_string_lit(p, error);
+      if (*error) { ng_json_free(node); return NULL; }
+
+      *p = ng_json_skip_whitespace(*p);
+      if (**p != ':') { free(key); *error = 1; ng_json_free(node); return NULL; }
+      (*p)++;
+
+      NgJson *val = ng_json_parse_value(p, error);
+      if (*error) { free(key); ng_json_free(node); return NULL; }
+
+      if (node->object_val.count >= node->object_val.cap) {
+        node->object_val.cap *= 2;
+        node->object_val.keys = realloc(node->object_val.keys, node->object_val.cap * sizeof(char*));
+        node->object_val.values = realloc(node->object_val.values, node->object_val.cap * sizeof(NgJson*));
+      }
+      node->object_val.keys[node->object_val.count] = key;
+      node->object_val.values[node->object_val.count] = val;
+      node->object_val.count++;
+
+      *p = ng_json_skip_whitespace(*p);
+      if (**p == '}') {
+        (*p)++;
+        return node;
+      } else if (**p == ',') {
+        (*p)++;
+      } else {
+        *error = 1; ng_json_free(node); return NULL;
+      }
+    }
+    *error = 1; ng_json_free(node); return NULL;
+  }
+
+  char *end = NULL;
+  int is_float = 0;
+  for (const char *s = *p; *s && *s != ',' && *s != '}' && *s != ']' && !isspace((unsigned char)*s); s++) {
+    if (*s == '.' || *s == 'e' || *s == 'E') { is_float = 1; }
+  }
+
+  NgJson *node = calloc(1, sizeof(NgJson));
+  if (is_float) {
+    double d = strtod(*p, &end);
+    if (end == *p) { free(node); *error = 1; return NULL; }
+    node->type = NG_JSON_FLOAT;
+    node->float_val = d;
+  } else {
+    int64_t i = strtoll(*p, &end, 10);
+    if (end == *p) { free(node); *error = 1; return NULL; }
+    node->type = NG_JSON_INT;
+    node->int_val = i;
+  }
+  *p = end;
+  return node;
+}
+
+static NgJson *ng_json_parse_text(const char *text) {
+  if (!text) return NULL;
+  int error = 0;
+  const char *p = ng_json_skip_whitespace(text);
+  NgJson *root = ng_json_parse_value(&p, &error);
+  if (error || !root) {
+    ng_json_free(root);
+    return NULL;
+  }
+  return root;
+}
+
+static NgJson *ng_json_find(NgJson *node, const char *path) {
+  if (!node || !path || !*path) return node;
+
+  char seg[256];
+  size_t i = 0;
+  while (*path && *path != '.' && *path != '[' && i < sizeof(seg) - 1) {
+    seg[i++] = *path++;
+  }
+  seg[i] = '\0';
+
+  if (*path == '[') {
+    if (i > 0) {
+      if (node->type != NG_JSON_OBJECT) return NULL;
+      NgJson *sub = NULL;
+      for (size_t j = 0; j < node->object_val.count; j++) {
+        if (strcmp(node->object_val.keys[j], seg) == 0) {
+          sub = node->object_val.values[j];
+          break;
+        }
+      }
+      if (!sub) return NULL;
+      node = sub;
+    }
+
+    while (*path == '[') {
+      path++;
+      int64_t idx = 0;
+      while (*path >= '0' && *path <= '9') {
+        idx = idx * 10 + (*path - '0');
+        path++;
+      }
+      if (*path == ']') path++;
+
+      if (node->type != NG_JSON_ARRAY || idx < 0 || (size_t)idx >= node->array_val.count) {
+        return NULL;
+      }
+      node = node->array_val.items[idx];
+    }
+
+    if (*path == '.') path++;
+    return ng_json_find(node, path);
+  } else {
+    if (node->type != NG_JSON_OBJECT) return NULL;
+    NgJson *sub = NULL;
+    for (size_t j = 0; j < node->object_val.count; j++) {
+      if (strcmp(node->object_val.keys[j], seg) == 0) {
+        sub = node->object_val.values[j];
+        break;
+      }
+    }
+    if (!sub) return NULL;
+
+    if (*path == '.') path++;
+    return ng_json_find(sub, path);
+  }
+}
+
+static void ng_json_append_str(char **buf, size_t *len, size_t *cap, const char *str) {
+  size_t slen = strlen(str);
+  if (*len + slen + 1 >= *cap) {
+    *cap = (*len + slen + 1) * 2;
+    char *nb = realloc(*buf, *cap);
+    if (!nb) { fprintf(stderr, "fatal: out of memory\n"); exit(1); }
+    *buf = nb;
+  }
+  strcpy(*buf + *len, str);
+  *len += slen;
+}
+
+static void ng_json_append_char(char **buf, size_t *len, size_t *cap, char c) {
+  if (*len + 2 >= *cap) {
+    *cap = (*cap) * 2;
+    char *nb = realloc(*buf, *cap);
+    if (!nb) { fprintf(stderr, "fatal: out of memory\n"); exit(1); }
+    *buf = nb;
+  }
+  (*buf)[(*len)++] = c;
+  (*buf)[*len] = '\0';
+}
+
+static void ng_json_stringify_node(NgJson *node, char **buf, size_t *len, size_t *cap) {
+  if (!node) {
+    ng_json_append_str(buf, len, cap, "null");
+    return;
+  }
+  char temp[128];
+  switch (node->type) {
+    case NG_JSON_NULL:
+      ng_json_append_str(buf, len, cap, "null");
+      break;
+    case NG_JSON_BOOL:
+      ng_json_append_str(buf, len, cap, node->boolean ? "true" : "false");
+      break;
+    case NG_JSON_INT:
+      snprintf(temp, sizeof(temp), "%lld", (long long)node->int_val);
+      ng_json_append_str(buf, len, cap, temp);
+      break;
+    case NG_JSON_FLOAT:
+      snprintf(temp, sizeof(temp), "%.16g", node->float_val);
+      ng_json_append_str(buf, len, cap, temp);
+      break;
+    case NG_JSON_STRING:
+      ng_json_append_char(buf, len, cap, '"');
+      for (const char *p = node->string_val; *p; p++) {
+        if (*p == '"') ng_json_append_str(buf, len, cap, "\\\"");
+        else if (*p == '\\') ng_json_append_str(buf, len, cap, "\\\\");
+        else if (*p == '\n') ng_json_append_str(buf, len, cap, "\\n");
+        else if (*p == '\r') ng_json_append_str(buf, len, cap, "\\r");
+        else if (*p == '\t') ng_json_append_str(buf, len, cap, "\\t");
+        else ng_json_append_char(buf, len, cap, *p);
+      }
+      ng_json_append_char(buf, len, cap, '"');
+      break;
+    case NG_JSON_ARRAY:
+      ng_json_append_char(buf, len, cap, '[');
+      for (size_t i = 0; i < node->array_val.count; i++) {
+        if (i > 0) ng_json_append_char(buf, len, cap, ',');
+        ng_json_stringify_node(node->array_val.items[i], buf, len, cap);
+      }
+      ng_json_append_char(buf, len, cap, ']');
+      break;
+    case NG_JSON_OBJECT:
+      ng_json_append_char(buf, len, cap, '{');
+      for (size_t i = 0; i < node->object_val.count; i++) {
+        if (i > 0) ng_json_append_char(buf, len, cap, ',');
+        ng_json_append_char(buf, len, cap, '"');
+        ng_json_append_str(buf, len, cap, node->object_val.keys[i]);
+        ng_json_append_str(buf, len, cap, "\":");
+        ng_json_stringify_node(node->object_val.values[i], buf, len, cap);
+      }
+      ng_json_append_char(buf, len, cap, '}');
+      break;
+  }
+}
+
+const char *ng_json_stringify(const char *json_handle) {
+  NgJson *node = (NgJson*)json_handle;
+  if (!node) return "null";
+  size_t cap = 256;
+  size_t len = 0;
+  char *buf = malloc(cap);
+  if (!buf) return "null";
+  buf[0] = '\0';
+  ng_json_stringify_node(node, &buf, &len, &cap);
+  char *res = ng_runtime_string_alloc(len + 1);
+  if (!res) { free(buf); return "null"; }
+  strcpy(res, buf);
+  free(buf);
+  return res;
+}
+
+const char *ng_json_get(const char *json_handle, const char *path) {
+  NgJson *node = ng_json_find((NgJson*)json_handle, path);
+  if (!node) return "";
+  if (node->type == NG_JSON_STRING) {
+    if (!node->string_val) return "";
+    char *res = ng_runtime_string_alloc(strlen(node->string_val) + 1);
+    if (!res) return "";
+    strcpy(res, node->string_val);
+    return res;
+  }
+  if (node->type == NG_JSON_INT) {
+    char temp[64];
+    snprintf(temp, sizeof(temp), "%lld", (long long)node->int_val);
+    char *res = ng_runtime_string_alloc(strlen(temp) + 1);
+    if (!res) return "";
+    strcpy(res, temp);
+    return res;
+  }
+  if (node->type == NG_JSON_FLOAT) {
+    char temp[64];
+    snprintf(temp, sizeof(temp), "%.16g", node->float_val);
+    char *res = ng_runtime_string_alloc(strlen(temp) + 1);
+    if (!res) return "";
+    strcpy(res, temp);
+    return res;
+  }
+  if (node->type == NG_JSON_BOOL) {
+    const char *s = node->boolean ? "true" : "false";
+    char *res = ng_runtime_string_alloc(strlen(s) + 1);
+    if (!res) return "";
+    strcpy(res, s);
+    return res;
+  }
+  if (node->type == NG_JSON_NULL) {
+    char *res = ng_runtime_string_alloc(5);
+    if (!res) return "";
+    strcpy(res, "null");
+    return res;
+  }
+  return ng_json_stringify((const char*)node);
+}
+
+bool ng_json_has(const char *json_handle, const char *path) {
+  NgJson *node = ng_json_find((NgJson*)json_handle, path);
+  return node != NULL;
+}
+
+const char *ng_json_type(const char *json_handle, const char *path) {
+  NgJson *node = ng_json_find((NgJson*)json_handle, path);
+  if (!node) return "unknown";
+  const char *tname = "unknown";
+  switch (node->type) {
+    case NG_JSON_NULL: tname = "null"; break;
+    case NG_JSON_BOOL: tname = "boolean"; break;
+    case NG_JSON_INT:
+    case NG_JSON_FLOAT: tname = "number"; break;
+    case NG_JSON_STRING: tname = "string"; break;
+    case NG_JSON_ARRAY: tname = "array"; break;
+    case NG_JSON_OBJECT: tname = "object"; break;
+  }
+  char *res = ng_runtime_string_alloc(strlen(tname) + 1);
+  if (!res) return tname;
+  strcpy(res, tname);
+  return res;
+}
+
+const char *ng_json_parse(const char *text) {
+  NgJson *root = ng_json_parse_text(text);
+  if (!root) {
+    fprintf(stderr, "runtime error: invalid json\n");
+    exit(1);
+  }
+  return (const char*)root;
+}
+
+const char *ng_json_read(const char *path) {
+  if (!path) {
+    fprintf(stderr, "runtime error: null json file path\n");
+    exit(1);
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    fprintf(stderr, "runtime error: cannot read json file '%s'\n", path);
+    exit(1);
+  }
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size < 0) {
+    fclose(f);
+    fprintf(stderr, "runtime error: failed to read json file '%s'\n", path);
+    exit(1);
+  }
+  char *buf = malloc(size + 1);
+  if (!buf) {
+    fclose(f);
+    fprintf(stderr, "runtime error: out of memory\n");
+    exit(1);
+  }
+  size_t read_bytes = fread(buf, 1, size, f);
+  fclose(f);
+  buf[read_bytes] = '\0';
+
+  NgJson *root = ng_json_parse_text(buf);
+  free(buf);
+  if (!root) {
+    fprintf(stderr, "runtime error: invalid json in file '%s'\n", path);
+    exit(1);
+  }
+  return (const char*)root;
+}
+
+bool ng_json_write(const char *path, const char *json_handle) {
+  if (!path) return false;
+  const char *str = ng_json_stringify(json_handle);
+  FILE *f = fopen(path, "wb");
+  if (!f) return false;
+  size_t len = strlen(str);
+  size_t written = fwrite(str, 1, len, f);
+  fclose(f);
+  return written == len;
+}
+
+int64_t ng_string_to_int(const char *s) {
+  if (!s) return 0;
+  return (int64_t)strtoll(s, NULL, 10);
+}
+
+double ng_string_to_float(const char *s) {
+  if (!s) return 0.0;
+  return strtod(s, NULL);
+}
+
+
+const char *ng_string_slice(const char *text, int64_t start) {
+  if (!text) return "";
+  size_t len = strlen(text);
+  if (start < 0 || (uint64_t)start > len) return "";
+
+  const char *value = text + start;
+  char *result = ng_runtime_string_alloc(strlen(value) + 1);
+  if (!result) return "";
+  strcpy(result, value);
+  return result;
+}
+
+
+const char *ng_url_encode(const char *value) {
+  if (!value) return "";
+
+  CURL *curl = ng_http_init();
+  if (!curl) return "";
+
+  char *encoded = curl_easy_escape(curl, value, 0);
+  if (!encoded) {
+    curl_easy_cleanup(curl);
+    return "";
+  }
+
+  char *result = ng_runtime_string_alloc(strlen(encoded) + 1);
+  if (result) strcpy(result, encoded);
+
+  curl_free(encoded);
+  curl_easy_cleanup(curl);
+
+  return result ? result : "";
+}

@@ -1,0 +1,5 @@
+fn cmd_ping(token: string, chat: int, bot_name: string, owner_name: string, prefix: string, args: string) -> void {
+    let ping_text = "*PONG!*\n\nStatus: Online\nBot: " + bot_name + "\nOwner: " + owner_name + "\nCatatan: Waktu respons real-time milidetik belum didukung oleh runtime Ngawi Lang saat ini.";
+
+    rusdi_send(token, chat, ping_text);
+}

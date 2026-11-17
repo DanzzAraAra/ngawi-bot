@@ -1,0 +1,13 @@
+{
+  "bot": {
+    "token": "8238709389:AAGnN1hwC_gHsxPhhvMYQNS3OqofjG1fKbs",
+    "name": "KuroNekoBot",
+    "active": true,
+    "version": 1.5,
+    "tags": ["telegram", "bot", "ngawi"]
+  },
+  "owner": {
+    "id": 123456789,
+    "username": "balxzzy"
+  }
+}

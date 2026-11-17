@@ -1,0 +1,45 @@
+fn main() -> int {
+  let config = json_read("examples/settings.json");
+  
+  let token = json_get(config, "bot.token");
+  let name = json_get(config, "bot.name");
+  let owner_id = json_get(config, "owner.id");
+  let active = json_get(config, "bot.active");
+  let first_tag = json_get(config, "bot.tags[0]");
+  let second_tag = json_get(config, "bot.tags[1]");
+
+  print(name);
+  print(token);
+  print(owner_id);
+  print(active);
+  print(first_tag);
+  print(second_tag);
+
+  // Test json_has
+  let has_token = json_has(config, "bot.token");
+  let has_missing = json_has(config, "bot.missing_key");
+  print(has_token);
+  print(has_missing);
+
+  // Test json_type
+  let type_name = json_type(config, "bot.name");
+  let type_active = json_type(config, "bot.active");
+  let type_tags = json_type(config, "bot.tags");
+  let type_owner = json_type(config, "owner");
+  print(type_name);
+  print(type_active);
+  print(type_tags);
+  print(type_owner);
+
+  // Test json_parse and stringify roundtrip
+  let serialized = json_stringify(config);
+  let parsed = json_parse(serialized);
+  let parsed_name = json_get(parsed, "bot.name");
+  print(parsed_name);
+
+  // Test json_write
+  let written = json_write("examples/output_settings.json", config);
+  print(written);
+
+  return 0;
+}

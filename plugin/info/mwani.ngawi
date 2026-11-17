@@ -1,0 +1,15 @@
+fn cmd_menu(token: string, chat: int, bot_name: string, owner_name: string, prefix: string, args: string) -> void {
+    let menu_text = "*MENU BOT*\n\nNama Bot: " + bot_name + "\nOwner: " + owner_name + "\nPrefix: " + prefix + "\n\n*DAFTAR COMMAND*\n";
+
+    for (let i: int = 0; i < plugin_count(); i++) {
+        menu_text = menu_text + "\n- " + prefix + plugin_name(i);
+    }
+
+    rusdi_send(token, chat, menu_text);
+}
+
+fn cmd_help(token: string, chat: int, bot_name: string, owner_name: string, prefix: string, args: string) -> void {
+    let help_text = "*BOT HELP*\n\nGunakan prefix `" + prefix + "` sebelum nama command.\n\nKetik " + prefix + "menu untuk melihat semua command.";
+
+    rusdi_send(token, chat, help_text);
+}

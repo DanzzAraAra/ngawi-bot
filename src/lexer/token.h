@@ -1,0 +1,87 @@
+#ifndef NGAWI_TOKEN_H
+#define NGAWI_TOKEN_H
+
+#include <stddef.h>
+
+typedef enum TokenKind {
+  TOK_EOF = 0,
+  TOK_INVALID,
+
+  TOK_IDENT,
+  TOK_INT_LIT,
+  TOK_FLOAT_LIT,
+  TOK_STRING_LIT,
+
+  TOK_KW_FN,
+  TOK_KW_IMPORT,
+  TOK_KW_RETURN,
+  TOK_KW_LET,
+  TOK_KW_CONST,
+  TOK_KW_IF,
+  TOK_KW_ELIF,
+  TOK_KW_ELSE,
+  TOK_KW_WHILE,
+  TOK_KW_FOR,
+  TOK_KW_MATCH,
+  TOK_KW_BREAK,
+  TOK_KW_CONTINUE,
+  TOK_KW_TRUE,
+  TOK_KW_FALSE,
+  TOK_KW_VOID,
+  TOK_KW_INT,
+  TOK_KW_FLOAT,
+  TOK_KW_BOOL,
+  TOK_KW_STRING,
+  TOK_KW_AMBA,
+  TOK_KW_RUSDI,
+  TOK_KW_FUAD,
+  TOK_KW_IMUT,
+
+  TOK_PLUS,
+  TOK_PLUS_PLUS,
+  TOK_MINUS,
+  TOK_MINUS_MINUS,
+  TOK_STAR,
+  TOK_SLASH,
+  TOK_PERCENT,
+  TOK_BANG,
+  TOK_ASSIGN,
+  TOK_PLUS_ASSIGN,
+  TOK_MINUS_ASSIGN,
+  TOK_STAR_ASSIGN,
+  TOK_SLASH_ASSIGN,
+  TOK_PERCENT_ASSIGN,
+
+  TOK_EQ,
+  TOK_NE,
+  TOK_LT,
+  TOK_LE,
+  TOK_GT,
+  TOK_GE,
+  TOK_AND_AND,
+  TOK_OR_OR,
+  TOK_ARROW,
+  TOK_FAT_ARROW,
+
+  TOK_LPAREN,
+  TOK_RPAREN,
+  TOK_LBRACE,
+  TOK_RBRACE,
+  TOK_LBRACKET,
+  TOK_RBRACKET,
+  TOK_COMMA,
+  TOK_COLON,
+  TOK_SEMI,
+} TokenKind;
+
+typedef struct Token {
+  TokenKind kind;
+  const char *start;
+  size_t length;
+  int line;
+  int col;
+} Token;
+
+const char *token_kind_name(TokenKind kind);
+
+#endif

@@ -1,0 +1,3 @@
+fn cmd_ex(token: string, chat: int, bot_name: string, owner_name: string, prefix: string, args: string) -> void {
+    rusdi_send(token, chat, "testing");
+}

@@ -1,0 +1,46 @@
+fn log_info(message: string) -> void {
+    print("[INFO] " + message);
+}
+
+fn log_success(message: string) -> void {
+    print("[SUCCESS] " + message);
+}
+
+fn log_warn(message: string) -> void {
+    print("[WARN] " + message);
+}
+
+fn log_error(message: string) -> void {
+    print("[ERROR] " + message);
+}
+
+fn log_debug(message: string) -> void {
+    print("[DEBUG] " + message);
+}
+
+fn log_start(bot_name: string) -> void {
+    print("");
+    print("—————————————————");
+    print(" " + bot_name + " - Telegram Bot");
+    print("—————————————————");
+    log_success("Bot berhasil dijalankan");
+}
+
+fn log_plugin(count: int) -> void {
+    print("[PLUGIN] Loaded plugins:");
+    print(count);
+}
+
+fn log_message(chat: int, sender: string, message: string) -> void {
+    print("[MESSAGE] Chat ID:");
+    print(chat);
+    print("[MESSAGE] Sender: " + sender);
+    print("[MESSAGE] Text: " + message);
+}
+
+fn log_command(chat: int, command: string, sender: string) -> void {
+    print("[COMMAND] " + command);
+    print("[COMMAND] Chat ID:");
+    print(chat);
+    print("[COMMAND] Sender: " + sender);
+}

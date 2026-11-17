@@ -1,0 +1,63 @@
+fn cmd_yts(token: string, chat: int, bot_name: string, owner_name: string, prefix: string, args: string) -> void {
+    if (args == "") {
+        rusdi_send(token, chat, "Ex: " + prefix + "yts Billie Eilish");
+        return;
+    }
+
+    let query = url_encode(trim(args));
+    let response = api_get("/api/search/yts?q=" + query);
+    let data = json_parse(response);
+
+    if (json_get(data, "status") != "true") {
+        rusdi_send(token, chat, "Pencarian gagal");
+        return;
+    }
+
+    let title1 = json_get(data, "result[0].title");
+    let title2 = json_get(data, "result[1].title");
+    let title3 = json_get(data, "result[2].title");
+    let title4 = json_get(data, "result[3].title");
+    let title5 = json_get(data, "result[4].title");
+
+    if (title1 == "") {
+        rusdi_send(token, chat, "Tidak ada hasil ditemukan.");
+        return;
+    }
+
+    let message = "*[ SEARCH RESULTS ]*\n\n";
+
+    message = message + "1. " + title1 + "\n";
+    message = message + "Durasi: " + json_get(data, "result[0].duration") + "\n";
+    message = message + "Views: " + json_get(data, "result[0].views") + "\n";
+    message = message + json_get(data, "result[0].url") + "\n\n";
+
+    if (title2 != "") {
+        message = message + "2. " + title2 + "\n";
+        message = message + "Durasi: " + json_get(data, "result[1].duration") + "\n";
+        message = message + "Views: " + json_get(data, "result[1].views") + "\n";
+        message = message + json_get(data, "result[1].url") + "\n\n";
+    }
+
+    if (title3 != "") {
+        message = message + "3. " + title3 + "\n";
+        message = message + "Durasi: " + json_get(data, "result[2].duration") + "\n";
+        message = message + "Views: " + json_get(data, "result[2].views") + "\n";
+        message = message + json_get(data, "result[2].url") + "\n\n";
+    }
+
+    if (title4 != "") {
+        message = message + "4. " + title4 + "\n";
+        message = message + "Durasi: " + json_get(data, "result[3].duration") + "\n";
+        message = message + "Views: " + json_get(data, "result[3].views") + "\n";
+        message = message + json_get(data, "result[3].url") + "\n\n";
+    }
+
+    if (title5 != "") {
+        message = message + "5. " + title5 + "\n";
+        message = message + "Durasi: " + json_get(data, "result[4].duration") + "\n";
+        message = message + "Views: " + json_get(data, "result[4].views") + "\n";
+        message = message + json_get(data, "result[4].url") + "\n\n";
+    }
+
+    rusdi_send(token, chat, message);
+}
