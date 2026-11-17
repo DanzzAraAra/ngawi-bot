@@ -1,0 +1,16 @@
+{
+  "prefix": "/",
+  "bot": {
+    "token": "",
+    "name": "Ngawi Bot"
+  },
+  "owner": {
+    "id": ,
+    "name": "Dandy"
+  },
+  "api": {
+    "baseUrl": "https://sylvatica.my.id",
+    "key": "",
+    "header": "x-api-key"
+    }
+}
