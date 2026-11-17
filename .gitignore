@@ -9,4 +9,3 @@
 /*.gcno
 /*.gcov
 /tests/golden/actual/*.c
-/settings.json
